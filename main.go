@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -11,7 +10,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -35,19 +33,20 @@ type Config struct {
 	SFTP struct {
 		Enable bool `yaml:"enable"`
 	} `yaml:"sftp"`
-	PortForwarding struct {
-		EnableLocal  bool `yaml:"enable_local"`
-		EnableRemote bool `yaml:"enable_remote"`
-	} `yaml:"port_forwarding"`
+	PortForward struct {
+		Enable         bool     `yaml:"enable"`
+		AllowedPorts   []int    `yaml:"allowed_ports"`
+		AllowedHosts   []string `yaml:"allowed_hosts"`
+		LocalForward   bool     `yaml:"local_forward"`
+		RemoteForward  bool     `yaml:"remote_forward"`
+		DynamicForward bool     `yaml:"dynamic_forward"`
+	} `yaml:"port_forward"`
 }
 
 // Global configuration variable
 var (
 	config     Config
 	configPath = "/ssh_config.yml"
-	// activeForwards tracks all active port forwards
-	activeForwards = make(map[string]net.Listener)
-	forwardMutex   sync.Mutex
 )
 
 func setWinsize(f *os.File, w, h int) {
@@ -62,8 +61,14 @@ func createDefaultConfig() error {
 	defaultConfig.SSH.Password = "password"
 	defaultConfig.SSH.Timeout = 300
 	defaultConfig.SFTP.Enable = true
-	defaultConfig.PortForwarding.EnableLocal = true
-	defaultConfig.PortForwarding.EnableRemote = true
+	
+	// Default port forwarding configuration
+	defaultConfig.PortForward.Enable = true
+	defaultConfig.PortForward.AllowedPorts = []int{80, 443, 8080, 3000, 5000, 8000, 9000}
+	defaultConfig.PortForward.AllowedHosts = []string{"localhost", "127.0.0.1", "::1"}
+	defaultConfig.PortForward.LocalForward = true
+	defaultConfig.PortForward.RemoteForward = true
+	defaultConfig.PortForward.DynamicForward = false
 
 	yamlData, err := yaml.Marshal(&defaultConfig)
 	if err != nil {
@@ -119,6 +124,167 @@ func sftpHandler(sess ssh.Session) {
 	} else if err != nil {
 		color.Red("sftp server completed with error: %s", err)
 	}
+}
+
+// Port forwarding helper functions
+func isPortAllowed(port int) bool {
+	if len(config.PortForward.AllowedPorts) == 0 {
+		return true // If no restrictions, allow all ports
+	}
+	
+	for _, allowedPort := range config.PortForward.AllowedPorts {
+		if port == allowedPort {
+			return true
+		}
+	}
+	return false
+}
+
+func isHostAllowed(host string) bool {
+	if len(config.PortForward.AllowedHosts) == 0 {
+		return true // If no restrictions, allow all hosts
+	}
+	
+	for _, allowedHost := range config.PortForward.AllowedHosts {
+		if host == allowedHost {
+			return true
+		}
+	}
+	return false
+}
+
+// Local port forwarding handler (ssh -L)
+func handleLocalForward(newCh ssh.NewChannel) {
+	if !config.PortForward.Enable || !config.PortForward.LocalForward {
+		newCh.Reject(ssh.Prohibited, "local forwarding disabled")
+		return
+	}
+
+	// Parse the forwarding request
+	var payload struct {
+		DestAddr string
+		DestPort uint32
+		OrigAddr string
+		OrigPort uint32
+	}
+	
+	if err := ssh.Unmarshal(newCh.ExtraData(), &payload); err != nil {
+		newCh.Reject(ssh.UnknownChannelType, "failed to parse forward data")
+		return
+	}
+
+	// Check if destination is allowed
+	if !isHostAllowed(payload.DestAddr) || !isPortAllowed(int(payload.DestPort)) {
+		color.Red("Port forwarding rejected: %s:%d not allowed", payload.DestAddr, payload.DestPort)
+		newCh.Reject(ssh.Prohibited, fmt.Sprintf("forwarding to %s:%d not allowed", payload.DestAddr, payload.DestPort))
+		return
+	}
+
+	// Establish connection to destination
+	destConn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", payload.DestAddr, payload.DestPort))
+	if err != nil {
+		color.Red("Failed to connect to %s:%d - %v", payload.DestAddr, payload.DestPort, err)
+		newCh.Reject(ssh.ConnectionFailed, err.Error())
+		return
+	}
+
+	// Accept the channel
+	channel, requests, err := newCh.Accept()
+	if err != nil {
+		destConn.Close()
+		return
+	}
+
+	color.Green("Local forward established: %s:%d -> %s:%d", payload.OrigAddr, payload.OrigPort, payload.DestAddr, payload.DestPort)
+
+	// Handle incoming requests
+	go ssh.DiscardRequests(requests)
+
+	// Relay data between SSH channel and destination
+	go func() {
+		defer channel.Close()
+		defer destConn.Close()
+		io.Copy(channel, destConn)
+	}()
+	
+	go func() {
+		defer channel.Close() 
+		defer destConn.Close()
+		io.Copy(destConn, channel)
+	}()
+}
+
+// Remote port forwarding handler (ssh -R)
+func handleRemoteForward(ctx ssh.Context, bindAddr string, bindPort uint32) bool {
+	if !config.PortForward.Enable || !config.PortForward.RemoteForward {
+		color.Red("Remote forwarding request rejected: disabled")
+		return false
+	}
+
+	// Check if binding is allowed
+	if !isHostAllowed(bindAddr) || !isPortAllowed(int(bindPort)) {
+		color.Red("Remote forwarding rejected: %s:%d not allowed", bindAddr, bindPort)
+		return false
+	}
+
+	// Start listening on the requested port
+	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", bindAddr, bindPort))
+	if err != nil {
+		color.Red("Failed to bind remote forward %s:%d - %v", bindAddr, bindPort, err)
+		return false
+	}
+
+	color.Green("Remote forward bound: %s:%d", bindAddr, bindPort)
+
+	// Handle incoming connections
+	go func() {
+		defer listener.Close()
+		
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				color.Red("Remote forward accept error: %v", err)
+				return
+			}
+
+			// Handle each connection in a goroutine
+			go func(localConn net.Conn) {
+				defer localConn.Close()
+
+				// Create a new channel for this connection
+				channel, reqs, err := ctx.OpenChannel("forwarded-tcpip", ssh.Marshal(struct {
+					DestAddr   string
+					DestPort   uint32
+					OrigAddr   string
+					OrigPort   uint32
+				}{
+					bindAddr,
+					bindPort,
+					localConn.RemoteAddr().(*net.TCPAddr).IP.String(),
+					uint32(localConn.RemoteAddr().(*net.TCPAddr).Port),
+				}))
+
+				if err != nil {
+					color.Red("Failed to open forwarded channel: %v", err)
+					return
+				}
+
+				go ssh.DiscardRequests(reqs)
+
+				// Relay data
+				go func() {
+					defer channel.Close()
+					defer localConn.Close()
+					io.Copy(localConn, channel)
+				}()
+
+				io.Copy(channel, localConn)
+				channel.Close()
+			}(conn)
+		}
+	}()
+
+	return true
 }
 
 func logLoginAttempt(ip, user string, success bool, method string) {
@@ -197,104 +363,6 @@ func checkPassword(storedPassword, inputPassword string) bool {
 	return storedPassword == inputPassword
 }
 
-// handleForwardTCPIP handles incoming port forwarding requests
-func handleForwardTCPIP(srv *ssh.Server, conn *ssh.ServerConn, req *ssh.Request) (bool, []byte) {
-	if !config.PortForwarding.EnableRemote {
-		return false, nil
-	}
-
-	var payload = req.Payload
-	var addr string
-	var port uint32
-
-	if len(payload) > 4 {
-		addr = string(payload[4:])
-	}
-	if len(payload) >= 4 {
-		port = binary.BigEndian.Uint32(payload[:4])
-	}
-
-	listenAddr := fmt.Sprintf("%s:%d", addr, port)
-	listener, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		color.Red("Failed to listen on %s: %v", listenAddr, err)
-		return false, nil
-	}
-
-	// Store the listener for later cleanup
-	forwardKey := fmt.Sprintf("%s:%d", addr, port)
-	forwardMutex.Lock()
-	activeForwards[forwardKey] = listener
-	forwardMutex.Unlock()
-
-	color.Green("Started remote forwarding from %s", listenAddr)
-
-	// Start accepting connections in a goroutine
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				if !strings.Contains(err.Error(), "use of closed network connection") {
-					color.Red("Error accepting connection: %v", err)
-				}
-				return
-			}
-
-			remoteAddr := conn.RemoteAddr().String()
-			color.Cyan("New forwarding connection from %s", remoteAddr)
-
-			// Forward the connection to the client
-			dialAddr := fmt.Sprintf("127.0.0.1:%d", port)
-			remote, err := net.Dial("tcp", dialAddr)
-			if err != nil {
-				color.Red("Failed to dial %s: %v", dialAddr, err)
-				conn.Close()
-				continue
-			}
-
-			// Copy data between the connections
-			go func() {
-				defer conn.Close()
-				defer remote.Close()
-				go io.Copy(conn, remote)
-				io.Copy(remote, conn)
-			}()
-		}
-	}()
-
-	// Return the port we're listening on
-	resp := make([]byte, 4)
-	binary.BigEndian.PutUint32(resp, port)
-	return true, resp
-}
-
-// handleCancelForwardTCPIP handles cancellation of port forwarding
-func handleCancelForwardTCPIP(srv *ssh.Server, conn *ssh.ServerConn, req *ssh.Request) (bool, []byte) {
-	var payload = req.Payload
-	var addr string
-	var port uint32
-
-	if len(payload) > 4 {
-		addr = string(payload[4:])
-	}
-	if len(payload) >= 4 {
-		port = binary.BigEndian.Uint32(payload[:4])
-	}
-
-	forwardKey := fmt.Sprintf("%s:%d", addr, port)
-	forwardMutex.Lock()
-	defer forwardMutex.Unlock()
-
-	if listener, ok := activeForwards[forwardKey]; ok {
-		listener.Close()
-		delete(activeForwards, forwardKey)
-		color.Yellow("Stopped forwarding from %s", forwardKey)
-		return true, nil
-	}
-
-	return false, nil
-}
-
 func main() {
 	// Load configuration from YAML file
 	if err := loadConfig(); err != nil {
@@ -326,9 +394,25 @@ func main() {
 		},
 	}
 
+	// Configure SFTP if enabled
 	if config.SFTP.Enable {
 		server.SubsystemHandlers = map[string]ssh.SubsystemHandler{
 			"sftp": sftpHandler,
+		}
+	}
+
+	// Configure port forwarding if enabled
+	if config.PortForward.Enable {
+		// Local forwarding (ssh -L)
+		if config.PortForward.LocalForward {
+			server.ChannelHandlers = map[string]ssh.ChannelHandler{
+				"direct-tcpip": handleLocalForward,
+			}
+		}
+
+		// Remote forwarding (ssh -R)
+		if config.PortForward.RemoteForward {
+			server.ReversePortForwardingCallback = handleRemoteForward
 		}
 	}
 
@@ -351,18 +435,16 @@ func main() {
 		color.Yellow("  - Using bcrypt hashed password")
 	}
 	color.Yellow("  - SFTP enabled: %v", config.SFTP.Enable)
-	color.Yellow("  - Local port forwarding enabled: %v", config.PortForwarding.EnableLocal)
-	color.Yellow("  - Remote port forwarding enabled: %v", config.PortForwarding.EnableRemote)
+	color.Yellow("  - Port forwarding enabled: %v", config.PortForward.Enable)
+	if config.PortForward.Enable {
+		color.Yellow("    - Local forward (ssh -L): %v", config.PortForward.LocalForward)
+		color.Yellow("    - Remote forward (ssh -R): %v", config.PortForward.RemoteForward)
+		color.Yellow("    - Allowed ports: %v", config.PortForward.AllowedPorts)
+		color.Yellow("    - Allowed hosts: %v", config.PortForward.AllowedHosts)
+	}
+	
 	color.Blue("Starting SSH server on port %s...", config.SSH.Port)
 	color.Yellow("  - Type 'q' to exit.")
-
-	// Configure port forwarding if enabled
-	if config.PortForwarding.EnableLocal || config.PortForwarding.EnableRemote {
-		server.RequestHandlers = map[string]ssh.RequestHandler{
-			"tcpip-forward":        handleForwardTCPIP,
-			"cancel-tcpip-forward": handleCancelForwardTCPIP,
-		}
-	}
 
 	// Start the SSH server in a separate goroutine
 	go func() {
