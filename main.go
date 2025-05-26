@@ -2,6 +2,11 @@ package main
 
 import (
 	"bufio"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/binary"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
@@ -10,15 +15,16 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
 
 	"github.com/creack/pty"
 	"github.com/fatih/color"
-	"github.com/gliderlabs/ssh"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/crypto/ssh"
 	"gopkg.in/yaml.v3"
 )
 
@@ -34,24 +40,90 @@ type Config struct {
 		Enable bool `yaml:"enable"`
 	} `yaml:"sftp"`
 	PortForward struct {
-		Enable         bool     `yaml:"enable"`
-		AllowedPorts   []int    `yaml:"allowed_ports"`
-		AllowedHosts   []string `yaml:"allowed_hosts"`
-		LocalForward   bool     `yaml:"local_forward"`
-		RemoteForward  bool     `yaml:"remote_forward"`
-		DynamicForward bool     `yaml:"dynamic_forward"`
+		Enable        bool     `yaml:"enable"`
+		AllowedPorts  []int    `yaml:"allowed_ports"`
+		AllowedHosts  []string `yaml:"allowed_hosts"`
+		LocalForward  bool     `yaml:"local_forward"`
+		RemoteForward bool     `yaml:"remote_forward"`
 	} `yaml:"port_forward"`
 }
 
-// Global configuration variable
+// Global configuration and state
 var (
-	config     Config
-	configPath = "/ssh_config.yml"
+	config           Config
+	configPath       = "/ssh_config.yml"
+	activeForwards   = make(map[string]net.Listener)
+	forwardsMutex    sync.RWMutex
+	serverPrivateKey ssh.Signer
 )
+
+// SSH message structures for port forwarding
+type directTCPIPMsg struct {
+	DestAddr   string
+	DestPort   uint32
+	OrigAddr   string
+	OrigPort   uint32
+}
+
+type forwardedTCPIPMsg struct {
+	BindAddr   string
+	BindPort   uint32
+	OrigAddr   string
+	OrigPort   uint32
+}
+
+type tcpipForwardMsg struct {
+	BindAddr string
+	BindPort uint32
+}
+
+type tcpipForwardReplyMsg struct {
+	BindPort uint32
+}
 
 func setWinsize(f *os.File, w, h int) {
 	syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(syscall.TIOCSWINSZ),
 		uintptr(unsafe.Pointer(&struct{ h, w, x, y uint16 }{uint16(h), uint16(w), 0, 0})))
+}
+
+func generateHostKey() (ssh.Signer, error) {
+	keyPath := "/ssh_host_key"
+	
+	// Try to load existing key
+	if keyBytes, err := os.ReadFile(keyPath); err == nil {
+		if key, err := ssh.ParsePrivateKey(keyBytes); err == nil {
+			color.Green("Loaded existing host key")
+			return key, nil
+		}
+	}
+	
+	// Generate new key
+	color.Yellow("Generating new host key...")
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, err
+	}
+	
+	// Convert to SSH format
+	privateKeyPEM := &pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
+	}
+	
+	privateKeyBytes := pem.EncodeToMemory(privateKeyPEM)
+	
+	// Save key to file
+	if err := os.WriteFile(keyPath, privateKeyBytes, 0600); err != nil {
+		color.Red("Warning: Could not save host key: %v", err)
+	}
+	
+	signer, err := ssh.NewSignerFromKey(privateKey)
+	if err != nil {
+		return nil, err
+	}
+	
+	color.Green("Generated new host key")
+	return signer, nil
 }
 
 func createDefaultConfig() error {
@@ -68,7 +140,6 @@ func createDefaultConfig() error {
 	defaultConfig.PortForward.AllowedHosts = []string{"localhost", "127.0.0.1", "::1"}
 	defaultConfig.PortForward.LocalForward = true
 	defaultConfig.PortForward.RemoteForward = true
-	defaultConfig.PortForward.DynamicForward = false
 
 	yamlData, err := yaml.Marshal(&defaultConfig)
 	if err != nil {
@@ -108,24 +179,6 @@ func loadConfig() error {
 	return nil
 }
 
-func sftpHandler(sess ssh.Session) {
-	debugStream := io.Discard
-	serverOptions := []sftp.ServerOption{
-		sftp.WithDebug(debugStream),
-	}
-	server, err := sftp.NewServer(sess, serverOptions...)
-	if err != nil {
-		color.Red("sftp server init error: %s", err)
-		return
-	}
-	if err := server.Serve(); err == io.EOF {
-		server.Close()
-		color.Green("sftp client exited session.")
-	} else if err != nil {
-		color.Red("sftp server completed with error: %s", err)
-	}
-}
-
 // Port forwarding helper functions
 func isPortAllowed(port int) bool {
 	if len(config.PortForward.AllowedPorts) == 0 {
@@ -153,117 +206,135 @@ func isHostAllowed(host string) bool {
 	return false
 }
 
-// Local port forwarding handler (ssh -L)
-func handleLocalForward(newCh ssh.NewChannel) {
+// Handle direct-tcpip channel (Local forwarding: ssh -L)
+func handleDirectTCPIP(newChannel ssh.NewChannel) {
 	if !config.PortForward.Enable || !config.PortForward.LocalForward {
-		newCh.Reject(ssh.Prohibited, "local forwarding disabled")
+		newChannel.Reject(ssh.Prohibited, "local forwarding disabled")
 		return
 	}
 
-	// Parse the forwarding request
-	var payload struct {
-		DestAddr string
-		DestPort uint32
-		OrigAddr string
-		OrigPort uint32
-	}
-	
-	if err := ssh.Unmarshal(newCh.ExtraData(), &payload); err != nil {
-		newCh.Reject(ssh.UnknownChannelType, "failed to parse forward data")
+	var msg directTCPIPMsg
+	if err := ssh.Unmarshal(newChannel.ExtraData(), &msg); err != nil {
+		newChannel.Reject(ssh.UnknownChannelType, "failed to parse forward data")
 		return
 	}
 
 	// Check if destination is allowed
-	if !isHostAllowed(payload.DestAddr) || !isPortAllowed(int(payload.DestPort)) {
-		color.Red("Port forwarding rejected: %s:%d not allowed", payload.DestAddr, payload.DestPort)
-		newCh.Reject(ssh.Prohibited, fmt.Sprintf("forwarding to %s:%d not allowed", payload.DestAddr, payload.DestPort))
+	if !isHostAllowed(msg.DestAddr) || !isPortAllowed(int(msg.DestPort)) {
+		color.Red("Local forward rejected: %s:%d not allowed", msg.DestAddr, msg.DestPort)
+		newChannel.Reject(ssh.Prohibited, fmt.Sprintf("forwarding to %s:%d not allowed", msg.DestAddr, msg.DestPort))
 		return
 	}
 
-	// Establish connection to destination
-	destConn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", payload.DestAddr, payload.DestPort))
+	// Connect to destination
+	destAddr := fmt.Sprintf("%s:%d", msg.DestAddr, msg.DestPort)
+	destConn, err := net.Dial("tcp", destAddr)
 	if err != nil {
-		color.Red("Failed to connect to %s:%d - %v", payload.DestAddr, payload.DestPort, err)
-		newCh.Reject(ssh.ConnectionFailed, err.Error())
+		color.Red("Failed to connect to %s: %v", destAddr, err)
+		newChannel.Reject(ssh.ConnectionFailed, err.Error())
 		return
 	}
 
 	// Accept the channel
-	channel, requests, err := newCh.Accept()
+	channel, requests, err := newChannel.Accept()
 	if err != nil {
 		destConn.Close()
 		return
 	}
 
-	color.Green("Local forward established: %s:%d -> %s:%d", payload.OrigAddr, payload.OrigPort, payload.DestAddr, payload.DestPort)
+	color.Green("Local forward: %s:%d -> %s", msg.DestAddr, msg.DestPort, destAddr)
 
-	// Handle incoming requests
+	// Handle requests
 	go ssh.DiscardRequests(requests)
 
-	// Relay data between SSH channel and destination
+	// Relay data
+	go func() {
+		defer channel.Close()
+		defer destConn.Close()
+		io.Copy(destConn, channel)
+	}()
+
 	go func() {
 		defer channel.Close()
 		defer destConn.Close()
 		io.Copy(channel, destConn)
 	}()
-	
-	go func() {
-		defer channel.Close() 
-		defer destConn.Close()
-		io.Copy(destConn, channel)
-	}()
 }
 
-// Remote port forwarding handler (ssh -R)
-func handleRemoteForward(ctx ssh.Context, bindAddr string, bindPort uint32) bool {
+// Handle tcpip-forward request (Remote forwarding: ssh -R)
+func handleTCPIPForward(conn *ssh.ServerConn, req *ssh.Request) {
 	if !config.PortForward.Enable || !config.PortForward.RemoteForward {
-		color.Red("Remote forwarding request rejected: disabled")
-		return false
+		req.Reply(false, nil)
+		return
+	}
+
+	var msg tcpipForwardMsg
+	if err := ssh.Unmarshal(req.Payload, &msg); err != nil {
+		req.Reply(false, nil)
+		return
 	}
 
 	// Check if binding is allowed
-	if !isHostAllowed(bindAddr) || !isPortAllowed(int(bindPort)) {
-		color.Red("Remote forwarding rejected: %s:%d not allowed", bindAddr, bindPort)
-		return false
+	if !isHostAllowed(msg.BindAddr) || !isPortAllowed(int(msg.BindPort)) {
+		color.Red("Remote forward rejected: %s:%d not allowed", msg.BindAddr, msg.BindPort)
+		req.Reply(false, nil)
+		return
 	}
 
-	// Start listening on the requested port
-	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", bindAddr, bindPort))
+	// Start listening
+	bindAddr := fmt.Sprintf("%s:%d", msg.BindAddr, msg.BindPort)
+	if msg.BindAddr == "" {
+		bindAddr = fmt.Sprintf(":%d", msg.BindPort)
+	}
+
+	listener, err := net.Listen("tcp", bindAddr)
 	if err != nil {
-		color.Red("Failed to bind remote forward %s:%d - %v", bindAddr, bindPort, err)
-		return false
+		color.Red("Failed to bind remote forward %s: %v", bindAddr, err)
+		req.Reply(false, nil)
+		return
 	}
 
-	color.Green("Remote forward bound: %s:%d", bindAddr, bindPort)
+	// Store the listener for cleanup
+	forwardKey := fmt.Sprintf("%s:%d", msg.BindAddr, msg.BindPort)
+	forwardsMutex.Lock()
+	activeForwards[forwardKey] = listener
+	forwardsMutex.Unlock()
+
+	color.Green("Remote forward bound: %s", bindAddr)
+
+	// Reply with the actual bound port
+	actualPort := uint32(listener.Addr().(*net.TCPAddr).Port)
+	reply := tcpipForwardReplyMsg{BindPort: actualPort}
+	req.Reply(true, ssh.Marshal(&reply))
 
 	// Handle incoming connections
 	go func() {
 		defer listener.Close()
-		
+		defer func() {
+			forwardsMutex.Lock()
+			delete(activeForwards, forwardKey)
+			forwardsMutex.Unlock()
+		}()
+
 		for {
-			conn, err := listener.Accept()
+			localConn, err := listener.Accept()
 			if err != nil {
-				color.Red("Remote forward accept error: %v", err)
 				return
 			}
 
-			// Handle each connection in a goroutine
-			go func(localConn net.Conn) {
-				defer localConn.Close()
+			go func(lc net.Conn) {
+				defer lc.Close()
 
-				// Create a new channel for this connection
-				channel, reqs, err := ctx.OpenChannel("forwarded-tcpip", ssh.Marshal(struct {
-					DestAddr   string
-					DestPort   uint32
-					OrigAddr   string
-					OrigPort   uint32
-				}{
-					bindAddr,
-					bindPort,
-					localConn.RemoteAddr().(*net.TCPAddr).IP.String(),
-					uint32(localConn.RemoteAddr().(*net.TCPAddr).Port),
-				}))
+				// Create forwarded-tcpip channel
+				remoteAddr := lc.RemoteAddr().(*net.TCPAddr)
+				payload := ssh.Marshal(&forwardedTCPIPMsg{
+					BindAddr: msg.BindAddr,
+					BindPort: msg.BindPort,
+					OrigAddr: remoteAddr.IP.String(),
+					OrigPort: uint32(remoteAddr.Port),
+				})
 
+				channel, reqs, err := conn.OpenChannel("forwarded-tcpip", payload)
 				if err != nil {
 					color.Red("Failed to open forwarded channel: %v", err)
 					return
@@ -274,17 +345,121 @@ func handleRemoteForward(ctx ssh.Context, bindAddr string, bindPort uint32) bool
 				// Relay data
 				go func() {
 					defer channel.Close()
-					defer localConn.Close()
-					io.Copy(localConn, channel)
+					defer lc.Close()
+					io.Copy(lc, channel)
 				}()
 
-				io.Copy(channel, localConn)
+				io.Copy(channel, lc)
 				channel.Close()
-			}(conn)
+			}(localConn)
 		}
 	}()
+}
 
-	return true
+// Handle cancel-tcpip-forward request
+func handleCancelTCPIPForward(req *ssh.Request) {
+	var msg tcpipForwardMsg
+	if err := ssh.Unmarshal(req.Payload, &msg); err != nil {
+		req.Reply(false, nil)
+		return
+	}
+
+	forwardKey := fmt.Sprintf("%s:%d", msg.BindAddr, msg.BindPort)
+	forwardsMutex.Lock()
+	if listener, exists := activeForwards[forwardKey]; exists {
+		listener.Close()
+		delete(activeForwards, forwardKey)
+		color.Yellow("Cancelled remote forward: %s", forwardKey)
+		req.Reply(true, nil)
+	} else {
+		req.Reply(false, nil)
+	}
+	forwardsMutex.Unlock()
+}
+
+func handleSession(newChannel ssh.NewChannel) {
+	channel, requests, err := newChannel.Accept()
+	if err != nil {
+		return
+	}
+	defer channel.Close()
+
+	var shell *exec.Cmd
+	var ptyFile *os.File
+
+	// Handle session requests
+	go func() {
+		for req := range requests {
+			switch req.Type {
+			case "pty-req":
+				// Parse PTY request
+				shell = exec.Command("sh")
+				shell.Env = os.Environ()
+				
+				var err error
+				ptyFile, err = pty.Start(shell)
+				if err != nil {
+					color.Red("Failed to start PTY: %v", err)
+					req.Reply(false, nil)
+					continue
+				}
+				req.Reply(true, nil)
+
+			case "window-change":
+				if ptyFile != nil && len(req.Payload) >= 8 {
+					w := binary.BigEndian.Uint32(req.Payload[0:4])
+					h := binary.BigEndian.Uint32(req.Payload[4:8])
+					setWinsize(ptyFile, int(w), int(h))
+				}
+				req.Reply(true, nil)
+
+			case "shell":
+				if shell != nil && ptyFile != nil {
+					req.Reply(true, nil)
+					
+					// Relay data between SSH channel and PTY
+					go func() {
+						io.Copy(ptyFile, channel)
+						ptyFile.Close()
+					}()
+					
+					io.Copy(channel, ptyFile)
+					shell.Wait()
+					return
+				}
+				req.Reply(false, nil)
+
+			case "subsystem":
+				if len(req.Payload) > 4 {
+					subsystem := string(req.Payload[4:])
+					if subsystem == "sftp" && config.SFTP.Enable {
+						req.Reply(true, nil)
+						handleSFTP(channel)
+						return
+					}
+				}
+				req.Reply(false, nil)
+
+			default:
+				req.Reply(false, nil)
+			}
+		}
+	}()
+}
+
+func handleSFTP(channel ssh.Channel) {
+	server, err := sftp.NewServer(channel)
+	if err != nil {
+		color.Red("SFTP server init error: %v", err)
+		return
+	}
+	defer server.Close()
+
+	color.Green("SFTP session started")
+	if err := server.Serve(); err != nil && err != io.EOF {
+		color.Red("SFTP server error: %v", err)
+	}
+	color.Green("SFTP session ended")
 }
 
 func logLoginAttempt(ip, user string, success bool, method string) {
@@ -316,34 +491,6 @@ func logLoginAttempt(ip, user string, success bool, method string) {
 	}
 }
 
-func handleSession(s ssh.Session) {
-	cmd := exec.Command("sh")
-	ptyReq, winCh, isPty := s.Pty()
-	if isPty {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("TERM=%s", ptyReq.Term))
-		f, err := pty.Start(cmd)
-		if err != nil {
-			color.Red("Error starting pty: %v", err)
-			io.WriteString(s, fmt.Sprintf("Error starting pty: %v\n", err))
-			s.Exit(1)
-			return
-		}
-		go func() {
-			for win := range winCh {
-				setWinsize(f, win.Width, win.Height)
-			}
-		}()
-		go func() {
-			io.Copy(f, s)
-		}()
-		io.Copy(s, f)
-		cmd.Wait()
-	} else {
-		io.WriteString(s, "No PTY requested.\n")
-		s.Exit(1)
-	}
-}
-
 // Function to detect if a string is a bcrypt hash
 func isBcryptHash(str string) bool {
 	return len(str) > 0 && (strings.HasPrefix(str, "$2a$") ||
@@ -363,8 +510,64 @@ func checkPassword(storedPassword, inputPassword string) bool {
 	return storedPassword == inputPassword
 }
 
+func handleConnection(nConn net.Conn) {
+	defer nConn.Close()
+
+	// Create SSH server configuration
+	serverConfig := &ssh.ServerConfig{
+		PasswordCallback: func(conn ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+			user := conn.User()
+			password := string(pass)
+			ip := conn.RemoteAddr().String()
+
+			success := config.SSH.User == user && checkPassword(config.SSH.Password, password)
+			logLoginAttempt(ip, user, success, "password")
+
+			if success {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("authentication failed")
+		},
+	}
+
+	serverConfig.AddHostKey(serverPrivateKey)
+
+	// Perform SSH handshake
+	sshConn, chans, reqs, err := ssh.NewServerConn(nConn, serverConfig)
+	if err != nil {
+		return
+	}
+	defer sshConn.Close()
+
+	// Handle global requests
+	go func() {
+		for req := range reqs {
+			switch req.Type {
+			case "tcpip-forward":
+				handleTCPIPForward(sshConn, req)
+			case "cancel-tcpip-forward":
+				handleCancelTCPIPForward(req)
+			default:
+				req.Reply(false, nil)
+			}
+		}
+	}()
+
+	// Handle channels
+	for newChannel := range chans {
+		switch newChannel.ChannelType() {
+		case "session":
+			go handleSession(newChannel)
+		case "direct-tcpip":
+			go handleDirectTCPIP(newChannel)
+		default:
+			newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
+		}
+	}
+}
+
 func main() {
-	// Load configuration from YAML file
+	// Load configuration
 	if err := loadConfig(); err != nil {
 		color.Red("Failed to load configuration: %v", err)
 		os.Exit(1)
@@ -375,61 +578,18 @@ func main() {
 		config.SSH.Port = "2222"
 	}
 
-	// Parse timeout to duration
-	var sshTimeout time.Duration
-	if config.SSH.Timeout > 0 {
-		sshTimeout = time.Duration(config.SSH.Timeout) * time.Second
+	// Generate or load host key
+	var err error
+	serverPrivateKey, err = generateHostKey()
+	if err != nil {
+		color.Red("Failed to generate host key: %v", err)
+		os.Exit(1)
 	}
 
-	// Detect if password is hashed
+	// Display configuration
 	isPasswordHashed := isBcryptHash(config.SSH.Password)
-
-	server := &ssh.Server{
-		Addr: ":" + config.SSH.Port,
-		PasswordHandler: func(ctx ssh.Context, pass string) bool {
-			// Make sure username matches and check password
-			success := config.SSH.User == ctx.User() && checkPassword(config.SSH.Password, pass)
-			logLoginAttempt(ctx.RemoteAddr().String(), ctx.User(), success, "password")
-			return success
-		},
-	}
-
-	// Configure SFTP if enabled
-	if config.SFTP.Enable {
-		server.SubsystemHandlers = map[string]ssh.SubsystemHandler{
-			"sftp": sftpHandler,
-		}
-	}
-
-	// Configure port forwarding if enabled
-	if config.PortForward.Enable {
-		// Local forwarding (ssh -L)
-		if config.PortForward.LocalForward {
-			server.ChannelHandlers = map[string]ssh.ChannelHandler{
-				"direct-tcpip": handleLocalForward,
-			}
-		}
-
-		// Remote forwarding (ssh -R)
-		if config.PortForward.RemoteForward {
-			server.ReversePortForwardingCallback = handleRemoteForward
-		}
-	}
-
-	if config.SSH.Password == "" {
-		server.PasswordHandler = nil
-	}
-
-	server.Handle(handleSession)
-
-	if sshTimeout > 0 {
-		server.MaxTimeout = sshTimeout
-		server.IdleTimeout = sshTimeout
-		color.Yellow("SSH server configured with timeouts:")
-		color.Yellow("  - Maximum connection duration: %s", sshTimeout)
-		color.Yellow("  - Idle timeout: %s", sshTimeout)
-	}
-
+	color.Yellow("SSH Server Configuration:")
+	color.Yellow("  - Port: %s", config.SSH.Port)
 	color.Yellow("  - User: %s", config.SSH.User)
 	if isPasswordHashed {
 		color.Yellow("  - Using bcrypt hashed password")
@@ -442,21 +602,50 @@ func main() {
 		color.Yellow("    - Allowed ports: %v", config.PortForward.AllowedPorts)
 		color.Yellow("    - Allowed hosts: %v", config.PortForward.AllowedHosts)
 	}
-	
-	color.Blue("Starting SSH server on port %s...", config.SSH.Port)
-	color.Yellow("  - Type 'q' to exit.")
 
-	// Start the SSH server in a separate goroutine
+	color.Blue("Starting SSH server on port %s...", config.SSH.Port)
+	color.Yellow("Usage examples:")
+	color.Yellow("  SSH:           ssh %s@localhost -p %s", config.SSH.User, config.SSH.Port)
+	color.Yellow("  SFTP:          sftp -P %s %s@localhost", config.SSH.Port, config.SSH.User)
+	color.Yellow("  Local forward: ssh -L 8080:google.com:80 %s@localhost -p %s", config.SSH.User, config.SSH.Port)
+	color.Yellow("  Remote forward: ssh -R 9000:localhost:22 %s@localhost -p %s", config.SSH.User, config.SSH.Port)
+	color.Yellow("  Type 'q' to exit.")
+
+	// Start server
+	listener, err := net.Listen("tcp", ":"+config.SSH.Port)
+	if err != nil {
+		color.Red("Failed to listen on port %s: %v", config.SSH.Port, err)
+		os.Exit(1)
+	}
+	defer listener.Close()
+
+	// Accept connections in goroutine
 	go func() {
-		log.Fatal(server.ListenAndServe())
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				color.Red("Failed to accept connection: %v", err)
+				continue
+			}
+			go handleConnection(conn)
+		}
 	}()
 
-	// Scanner to detect 'q' input
+	// Wait for exit command
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.TrimSpace(line) == "q" {
-			color.Yellow("Exit command detected. Closing the SSH server.")
+			color.Yellow("Exit command detected. Closing SSH server...")
+			
+			// Close all active forwards
+			forwardsMutex.Lock()
+			for key, listener := range activeForwards {
+				listener.Close()
+				color.Yellow("Closed forward: %s", key)
+			}
+			forwardsMutex.Unlock()
+			
 			os.Exit(0)
 		}
 	}
