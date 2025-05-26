@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,6 +33,11 @@ type Config struct {
 	SFTP struct {
 		Enable bool `yaml:"enable"`
 	} `yaml:"sftp"`
+	PortForward struct {
+		Enable      bool     `yaml:"enable"`
+		AllowedPorts []int   `yaml:"allowed_ports"`
+		AllowedHosts []string `yaml:"allowed_hosts"`
+	} `yaml:"port_forward"`
 }
 
 // Global configuration variable
@@ -52,6 +58,9 @@ func createDefaultConfig() error {
 	defaultConfig.SSH.Password = "password"
 	defaultConfig.SSH.Timeout = 300
 	defaultConfig.SFTP.Enable = true
+	defaultConfig.PortForward.Enable = true
+	defaultConfig.PortForward.AllowedPorts = []int{80, 443, 8080, 3000, 5432, 3306}
+	defaultConfig.PortForward.AllowedHosts = []string{"localhost", "127.0.0.1", "::1"}
 
 	yamlData, err := yaml.Marshal(&defaultConfig)
 	if err != nil {
@@ -107,6 +116,117 @@ func sftpHandler(sess ssh.Session) {
 	} else if err != nil {
 		color.Red("sftp server completed with error: %s", err)
 	}
+}
+
+// Port forwarding helper functions
+func isPortAllowed(port int) bool {
+	if len(config.PortForward.AllowedPorts) == 0 {
+		return true // If no restrictions, allow all ports
+	}
+	
+	for _, allowedPort := range config.PortForward.AllowedPorts {
+		if port == allowedPort {
+			return true
+		}
+	}
+	return false
+}
+
+func isHostAllowed(host string) bool {
+	if len(config.PortForward.AllowedHosts) == 0 {
+		return true // If no restrictions, allow all hosts
+	}
+	
+	for _, allowedHost := range config.PortForward.AllowedHosts {
+		if host == allowedHost {
+			return true
+		}
+	}
+	return false
+}
+
+// Direct TCP/IP handler for port forwarding
+func directTCPIPHandler(srv *ssh.Server, conn *ssh.ServerConn, newChan ssh.NewChannel, ctx ssh.Context) {
+	if !config.PortForward.Enable {
+		newChan.Reject(ssh.Prohibited, "port forwarding disabled")
+		return
+	}
+
+	d := struct {
+		DestAddr string
+		DestPort uint32
+		SrcAddr  string
+		SrcPort  uint32
+	}{}
+
+	if err := ssh.Unmarshal(newChan.ExtraData(), &d); err != nil {
+		newChan.Reject(ssh.UnknownChannelType, "failed to parse direct-tcpip data")
+		return
+	}
+
+	// Check if destination host and port are allowed
+	if !isHostAllowed(d.DestAddr) {
+		color.Red("Port forward rejected: host %s not allowed", d.DestAddr)
+		newChan.Reject(ssh.Prohibited, fmt.Sprintf("host %s not allowed", d.DestAddr))
+		return
+	}
+
+	if !isPortAllowed(int(d.DestPort)) {
+		color.Red("Port forward rejected: port %d not allowed", d.DestPort)
+		newChan.Reject(ssh.Prohibited, fmt.Sprintf("port %d not allowed", d.DestPort))
+		return
+	}
+
+	// Connect to the destination
+	destAddr := fmt.Sprintf("%s:%d", d.DestAddr, d.DestPort)
+	destConn, err := net.Dial("tcp", destAddr)
+	if err != nil {
+		color.Red("Failed to connect to %s: %v", destAddr, err)
+		newChan.Reject(ssh.ConnectionFailed, err.Error())
+		return
+	}
+
+	// Accept the channel
+	ch, reqs, err := newChan.Accept()
+	if err != nil {
+		destConn.Close()
+		return
+	}
+
+	color.Green("Port forward established: %s:%d -> %s:%d (user: %s)", 
+		d.SrcAddr, d.SrcPort, d.DestAddr, d.DestPort, ctx.User())
+
+	// Handle channel requests (usually none for direct-tcpip)
+	go ssh.DiscardRequests(reqs)
+
+	// Start forwarding data between SSH channel and destination
+	go func() {
+		defer ch.Close()
+		defer destConn.Close()
+		io.Copy(destConn, ch)
+	}()
+
+	go func() {
+		defer ch.Close()
+		defer destConn.Close()
+		io.Copy(ch, destConn)
+	}()
+}
+
+// Reverse port forwarding handler
+func handleReversePortForward(ctx ssh.Context, bindHost string, bindPort uint32) bool {
+	if !config.PortForward.Enable {
+		return false
+	}
+
+	if !isHostAllowed(bindHost) || !isPortAllowed(int(bindPort)) {
+		color.Red("Reverse port forward rejected: %s:%d not allowed", bindHost, bindPort)
+		return false
+	}
+
+	color.Green("Reverse port forward request accepted: %s:%d (user: %s)", 
+		bindHost, bindPort, ctx.User())
+	return true
 }
 
 func logLoginAttempt(ip, user string, success bool, method string) {
@@ -216,10 +336,19 @@ func main() {
 		},
 	}
 
+	// Add SFTP support
 	if config.SFTP.Enable {
 		server.SubsystemHandlers = map[string]ssh.SubsystemHandler{
 			"sftp": sftpHandler,
 		}
+	}
+
+	// Add port forwarding support
+	if config.PortForward.Enable {
+		server.ChannelHandlers = map[string]ssh.ChannelHandler{
+			"direct-tcpip": directTCPIPHandler,
+		}
+		server.ReversePortForwardingCallback = handleReversePortForward
 	}
 
 	if config.SSH.Password == "" {
@@ -236,11 +365,27 @@ func main() {
 		color.Yellow("  - Idle timeout: %s", sshTimeout)
 	}
 
+	color.Yellow("SSH Server Configuration:")
 	color.Yellow("  - User: %s", config.SSH.User)
 	if isPasswordHashed {
 		color.Yellow("  - Using bcrypt hashed password")
 	}
 	color.Yellow("  - SFTP enabled: %v", config.SFTP.Enable)
+	color.Yellow("  - Port forwarding enabled: %v", config.PortForward.Enable)
+	
+	if config.PortForward.Enable {
+		if len(config.PortForward.AllowedPorts) > 0 {
+			color.Yellow("  - Allowed ports: %v", config.PortForward.AllowedPorts)
+		} else {
+			color.Yellow("  - Allowed ports: all")
+		}
+		if len(config.PortForward.AllowedHosts) > 0 {
+			color.Yellow("  - Allowed hosts: %v", config.PortForward.AllowedHosts)
+		} else {
+			color.Yellow("  - Allowed hosts: all")
+		}
+	}
+	
 	color.Blue("Starting SSH server on port %s...", config.SSH.Port)
 	color.Yellow("  - Type 'q' to exit.")
 
