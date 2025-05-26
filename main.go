@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -34,75 +35,19 @@ type Config struct {
 	SFTP struct {
 		Enable bool `yaml:"enable"`
 	} `yaml:"sftp"`
-	PortForward struct {
-		Enable bool `yaml:"enable"`
-		MaxConnections int `yaml:"max_connections"`
-	} `yaml:"port_forward"`
-}
-
-// PortForwardManager manages active port forward connections
-type PortForwardManager struct {
-	mu          sync.RWMutex
-	connections map[string]int
-	maxConns    int
-}
-
-func NewPortForwardManager(maxConns int) *PortForwardManager {
-	if maxConns <= 0 {
-		maxConns = 10 // default limit
-	}
-	return &PortForwardManager{
-		connections: make(map[string]int),
-		maxConns:    maxConns,
-	}
-}
-
-func (pfm *PortForwardManager) CanAcceptConnection(remoteAddr string) bool {
-	pfm.mu.RLock()
-	defer pfm.mu.RUnlock()
-	
-	total := 0
-	for _, count := range pfm.connections {
-		total += count
-	}
-	
-	return total < pfm.maxConns
-}
-
-func (pfm *PortForwardManager) AddConnection(remoteAddr string) {
-	pfm.mu.Lock()
-	defer pfm.mu.Unlock()
-	pfm.connections[remoteAddr]++
-}
-
-func (pfm *PortForwardManager) RemoveConnection(remoteAddr string) {
-	pfm.mu.Lock()
-	defer pfm.mu.Unlock()
-	if pfm.connections[remoteAddr] > 0 {
-		pfm.connections[remoteAddr]--
-		if pfm.connections[remoteAddr] == 0 {
-			delete(pfm.connections, remoteAddr)
-		}
-	}
-}
-
-func (pfm *PortForwardManager) GetStats() (int, int) {
-	pfm.mu.RLock()
-	defer pfm.mu.RUnlock()
-	
-	total := 0
-	for _, count := range pfm.connections {
-		total += count
-	}
-	
-	return total, len(pfm.connections)
+	PortForwarding struct {
+		EnableLocal  bool `yaml:"enable_local"`
+		EnableRemote bool `yaml:"enable_remote"`
+	} `yaml:"port_forwarding"`
 }
 
 // Global configuration variable
 var (
 	config     Config
 	configPath = "/ssh_config.yml"
-	pfManager  *PortForwardManager
+	// activeForwards tracks all active port forwards
+	activeForwards = make(map[string]net.Listener)
+	forwardMutex   sync.Mutex
 )
 
 func setWinsize(f *os.File, w, h int) {
@@ -117,8 +62,8 @@ func createDefaultConfig() error {
 	defaultConfig.SSH.Password = "password"
 	defaultConfig.SSH.Timeout = 300
 	defaultConfig.SFTP.Enable = true
-	defaultConfig.PortForward.Enable = true
-	defaultConfig.PortForward.MaxConnections = 10
+	defaultConfig.PortForwarding.EnableLocal = true
+	defaultConfig.PortForwarding.EnableRemote = true
 
 	yamlData, err := yaml.Marshal(&defaultConfig)
 	if err != nil {
@@ -173,114 +118,6 @@ func sftpHandler(sess ssh.Session) {
 		color.Green("sftp client exited session.")
 	} else if err != nil {
 		color.Red("sftp server completed with error: %s", err)
-	}
-}
-
-// TCP port forwarding handler
-func tcpForwardHandler(srv *ssh.Server, conn *ssh.ServerConn, newChan ssh.NewChannel) {
-	if !config.PortForward.Enable {
-		newChan.Reject(ssh.Prohibited, "port forwarding disabled")
-		return
-	}
-
-	// Parse the channel request
-	d := struct {
-		Addr string
-		Port uint32
-	}{}
-	
-	if err := ssh.Unmarshal(newChan.ExtraData(), &d); err != nil {
-		newChan.Reject(ssh.ConnectionFailed, "error parsing forward data")
-		return
-	}
-
-	// Check connection limits
-	remoteAddr := conn.RemoteAddr().String()
-	if !pfManager.CanAcceptConnection(remoteAddr) {
-		newChan.Reject(ssh.ResourceShortage, "too many port forward connections")
-		logPortForward(remoteAddr, fmt.Sprintf("%s:%d", d.Addr, d.Port), false, "connection limit exceeded")
-		return
-	}
-
-	// Connect to the target
-	target := fmt.Sprintf("%s:%d", d.Addr, d.Port)
-	targetConn, err := net.DialTimeout("tcp", target, 10*time.Second)
-	if err != nil {
-		newChan.Reject(ssh.ConnectionFailed, err.Error())
-		logPortForward(remoteAddr, target, false, fmt.Sprintf("connection failed: %v", err))
-		return
-	}
-
-	// Accept the channel
-	channel, requests, err := newChan.Accept()
-	if err != nil {
-		targetConn.Close()
-		logPortForward(remoteAddr, target, false, fmt.Sprintf("channel accept failed: %v", err))
-		return
-	}
-
-	// Track the connection
-	pfManager.AddConnection(remoteAddr)
-	logPortForward(remoteAddr, target, true, "connection established")
-
-	// Handle any requests on this channel (typically none for direct-tcpip)
-	go ssh.DiscardRequests(requests)
-
-	// Start copying data bidirectionally
-	go func() {
-		defer func() {
-			targetConn.Close()
-			channel.Close()
-			pfManager.RemoveConnection(remoteAddr)
-			logPortForward(remoteAddr, target, true, "connection closed")
-		}()
-
-		var wg sync.WaitGroup
-		wg.Add(2)
-
-		// Copy from SSH channel to target
-		go func() {
-			defer wg.Done()
-			io.Copy(targetConn, channel)
-		}()
-
-		// Copy from target to SSH channel
-		go func() {
-			defer wg.Done()
-			io.Copy(channel, targetConn)
-		}()
-
-		wg.Wait()
-	}()
-}
-
-func logPortForward(clientIP, target string, success bool, message string) {
-	timestamp := time.Now().Format(time.RFC3339)
-	logEntry := fmt.Sprintf("%s - Port Forward - IP: %s, Target: %s, Success: %v, Message: %s", 
-		timestamp, clientIP, target, success, message)
-
-	if success {
-		color.Green(logEntry)
-	} else {
-		color.Red(logEntry)
-	}
-
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		color.Red("Error getting home directory: %v", err)
-		return
-	}
-
-	logFile := filepath.Join(homeDir, "ssh.log")
-	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		color.Red("Error opening log file: %v", err)
-		return
-	}
-	defer f.Close()
-
-	if _, err := f.WriteString(logEntry + "\n"); err != nil {
-		color.Red("Error writing to log file: %v", err)
 	}
 }
 
@@ -360,14 +197,102 @@ func checkPassword(storedPassword, inputPassword string) bool {
 	return storedPassword == inputPassword
 }
 
-// Function to print port forward statistics
-func printPortForwardStats() {
-	if pfManager != nil {
-		total, clients := pfManager.GetStats()
-		if total > 0 {
-			color.Cyan("Port Forward Stats: %d active connections from %d clients", total, clients)
-		}
+// handleForwardTCPIP handles incoming port forwarding requests
+func handleForwardTCPIP(srv *ssh.Server, conn *ssh.ServerConn, req *ssh.Request) (bool, []byte) {
+	if !config.PortForwarding.EnableRemote {
+		return false, nil
 	}
+
+	var payload = req.Payload
+	var addr string
+	var port uint32
+
+	if len(payload) > 4 {
+		addr = string(payload[4:])
+	}
+	if len(payload) >= 4 {
+		port = binary.BigEndian.Uint32(payload[:4])
+	}
+
+	listenAddr := fmt.Sprintf("%s:%d", addr, port)
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		color.Red("Failed to listen on %s: %v", listenAddr, err)
+		return false, nil
+	}
+
+	// Store the listener for later cleanup
+	forwardKey := fmt.Sprintf("%s:%d", addr, port)
+	forwardMutex.Lock()
+	activeForwards[forwardKey] = listener
+	forwardMutex.Unlock()
+
+	color.Green("Started remote forwarding from %s", listenAddr)
+
+	// Start accepting connections in a goroutine
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				if !strings.Contains(err.Error(), "use of closed network connection") {
+					color.Red("Error accepting connection: %v", err)
+				}
+				return
+			}
+
+			remoteAddr := conn.RemoteAddr().String()
+			color.Cyan("New forwarding connection from %s", remoteAddr)
+
+			// Forward the connection to the client
+			dialAddr := fmt.Sprintf("127.0.0.1:%d", port)
+			remote, err := net.Dial("tcp", dialAddr)
+			if err != nil {
+				color.Red("Failed to dial %s: %v", dialAddr, err)
+				conn.Close()
+				continue
+			}
+
+			// Copy data between the connections
+			go func() {
+				defer conn.Close()
+				defer remote.Close()
+				go io.Copy(conn, remote)
+				io.Copy(remote, conn)
+			}()
+		}
+	}()
+
+	// Return the port we're listening on
+	resp := make([]byte, 4)
+	binary.BigEndian.PutUint32(resp, port)
+	return true, resp
+}
+
+// handleCancelForwardTCPIP handles cancellation of port forwarding
+func handleCancelForwardTCPIP(srv *ssh.Server, conn *ssh.ServerConn, req *ssh.Request) (bool, []byte) {
+	var payload = req.Payload
+	var addr string
+	var port uint32
+
+	if len(payload) > 4 {
+		addr = string(payload[4:])
+	}
+	if len(payload) >= 4 {
+		port = binary.BigEndian.Uint32(payload[:4])
+	}
+
+	forwardKey := fmt.Sprintf("%s:%d", addr, port)
+	forwardMutex.Lock()
+	defer forwardMutex.Unlock()
+
+	if listener, ok := activeForwards[forwardKey]; ok {
+		listener.Close()
+		delete(activeForwards, forwardKey)
+		color.Yellow("Stopped forwarding from %s", forwardKey)
+		return true, nil
+	}
+
+	return false, nil
 }
 
 func main() {
@@ -376,9 +301,6 @@ func main() {
 		color.Red("Failed to load configuration: %v", err)
 		os.Exit(1)
 	}
-
-	// Initialize port forward manager
-	pfManager = NewPortForwardManager(config.PortForward.MaxConnections)
 
 	// Set default port if not configured
 	if config.SSH.Port == "" {
@@ -404,17 +326,9 @@ func main() {
 		},
 	}
 
-	// Add SFTP support if enabled
 	if config.SFTP.Enable {
 		server.SubsystemHandlers = map[string]ssh.SubsystemHandler{
 			"sftp": sftpHandler,
-		}
-	}
-
-	// Add port forwarding support if enabled
-	if config.PortForward.Enable {
-		server.ChannelHandlers = map[string]ssh.ChannelHandler{
-			"direct-tcpip": tcpForwardHandler,
 		}
 	}
 
@@ -432,36 +346,36 @@ func main() {
 		color.Yellow("  - Idle timeout: %s", sshTimeout)
 	}
 
-	color.Yellow("SSH Server Configuration:")
 	color.Yellow("  - User: %s", config.SSH.User)
 	if isPasswordHashed {
 		color.Yellow("  - Using bcrypt hashed password")
 	}
 	color.Yellow("  - SFTP enabled: %v", config.SFTP.Enable)
-	color.Yellow("  - Port Forward enabled: %v", config.PortForward.Enable)
-	if config.PortForward.Enable {
-		color.Yellow("  - Max port forward connections: %d", config.PortForward.MaxConnections)
-	}
+	color.Yellow("  - Local port forwarding enabled: %v", config.PortForwarding.EnableLocal)
+	color.Yellow("  - Remote port forwarding enabled: %v", config.PortForwarding.EnableRemote)
 	color.Blue("Starting SSH server on port %s...", config.SSH.Port)
-	color.Yellow("  - Type 'q' to exit, 's' for stats.")
+	color.Yellow("  - Type 'q' to exit.")
+
+	// Configure port forwarding if enabled
+	if config.PortForwarding.EnableLocal || config.PortForwarding.EnableRemote {
+		server.RequestHandlers = map[string]ssh.RequestHandler{
+			"tcpip-forward":        handleForwardTCPIP,
+			"cancel-tcpip-forward": handleCancelForwardTCPIP,
+		}
+	}
 
 	// Start the SSH server in a separate goroutine
 	go func() {
 		log.Fatal(server.ListenAndServe())
 	}()
 
-	// Scanner to detect input
+	// Scanner to detect 'q' input
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		switch line {
-		case "q":
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "q" {
 			color.Yellow("Exit command detected. Closing the SSH server.")
 			os.Exit(0)
-		case "s":
-			printPortForwardStats()
-		default:
-			color.Yellow("Commands: 'q' to quit, 's' for port forward stats")
 		}
 	}
 }
