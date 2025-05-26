@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -34,16 +35,74 @@ type Config struct {
 		Enable bool `yaml:"enable"`
 	} `yaml:"sftp"`
 	PortForward struct {
-		Enable      bool     `yaml:"enable"`
-		AllowedPorts []int   `yaml:"allowed_ports"`
-		AllowedHosts []string `yaml:"allowed_hosts"`
+		Enable bool `yaml:"enable"`
+		MaxConnections int `yaml:"max_connections"`
 	} `yaml:"port_forward"`
+}
+
+// PortForwardManager manages active port forward connections
+type PortForwardManager struct {
+	mu          sync.RWMutex
+	connections map[string]int
+	maxConns    int
+}
+
+func NewPortForwardManager(maxConns int) *PortForwardManager {
+	if maxConns <= 0 {
+		maxConns = 10 // default limit
+	}
+	return &PortForwardManager{
+		connections: make(map[string]int),
+		maxConns:    maxConns,
+	}
+}
+
+func (pfm *PortForwardManager) CanAcceptConnection(remoteAddr string) bool {
+	pfm.mu.RLock()
+	defer pfm.mu.RUnlock()
+	
+	total := 0
+	for _, count := range pfm.connections {
+		total += count
+	}
+	
+	return total < pfm.maxConns
+}
+
+func (pfm *PortForwardManager) AddConnection(remoteAddr string) {
+	pfm.mu.Lock()
+	defer pfm.mu.Unlock()
+	pfm.connections[remoteAddr]++
+}
+
+func (pfm *PortForwardManager) RemoveConnection(remoteAddr string) {
+	pfm.mu.Lock()
+	defer pfm.mu.Unlock()
+	if pfm.connections[remoteAddr] > 0 {
+		pfm.connections[remoteAddr]--
+		if pfm.connections[remoteAddr] == 0 {
+			delete(pfm.connections, remoteAddr)
+		}
+	}
+}
+
+func (pfm *PortForwardManager) GetStats() (int, int) {
+	pfm.mu.RLock()
+	defer pfm.mu.RUnlock()
+	
+	total := 0
+	for _, count := range pfm.connections {
+		total += count
+	}
+	
+	return total, len(pfm.connections)
 }
 
 // Global configuration variable
 var (
 	config     Config
 	configPath = "/ssh_config.yml"
+	pfManager  *PortForwardManager
 )
 
 func setWinsize(f *os.File, w, h int) {
@@ -59,8 +118,7 @@ func createDefaultConfig() error {
 	defaultConfig.SSH.Timeout = 300
 	defaultConfig.SFTP.Enable = true
 	defaultConfig.PortForward.Enable = true
-	defaultConfig.PortForward.AllowedPorts = []int{80, 443, 8080, 3000, 5432, 3306}
-	defaultConfig.PortForward.AllowedHosts = []string{"localhost", "127.0.0.1", "::1"}
+	defaultConfig.PortForward.MaxConnections = 10
 
 	yamlData, err := yaml.Marshal(&defaultConfig)
 	if err != nil {
@@ -118,115 +176,112 @@ func sftpHandler(sess ssh.Session) {
 	}
 }
 
-// Port forwarding helper functions
-func isPortAllowed(port int) bool {
-	if len(config.PortForward.AllowedPorts) == 0 {
-		return true // If no restrictions, allow all ports
-	}
-	
-	for _, allowedPort := range config.PortForward.AllowedPorts {
-		if port == allowedPort {
-			return true
-		}
-	}
-	return false
-}
-
-func isHostAllowed(host string) bool {
-	if len(config.PortForward.AllowedHosts) == 0 {
-		return true // If no restrictions, allow all hosts
-	}
-	
-	for _, allowedHost := range config.PortForward.AllowedHosts {
-		if host == allowedHost {
-			return true
-		}
-	}
-	return false
-}
-
-// Direct TCP/IP handler for port forwarding
-func directTCPIPHandler(srv *ssh.Server, conn *ssh.ServerConn, newChan ssh.NewChannel, ctx ssh.Context) {
+// TCP port forwarding handler
+func tcpForwardHandler(srv *ssh.Server, conn *ssh.ServerConn, newChan ssh.NewChannel) {
 	if !config.PortForward.Enable {
 		newChan.Reject(ssh.Prohibited, "port forwarding disabled")
 		return
 	}
 
+	// Parse the channel request
 	d := struct {
-		DestAddr string
-		DestPort uint32
-		SrcAddr  string
-		SrcPort  uint32
+		Addr string
+		Port uint32
 	}{}
-
+	
 	if err := ssh.Unmarshal(newChan.ExtraData(), &d); err != nil {
-		newChan.Reject(ssh.UnknownChannelType, "failed to parse direct-tcpip data")
+		newChan.Reject(ssh.ConnectionFailed, "error parsing forward data")
 		return
 	}
 
-	// Check if destination host and port are allowed
-	if !isHostAllowed(d.DestAddr) {
-		color.Red("Port forward rejected: host %s not allowed", d.DestAddr)
-		newChan.Reject(ssh.Prohibited, fmt.Sprintf("host %s not allowed", d.DestAddr))
+	// Check connection limits
+	remoteAddr := conn.RemoteAddr().String()
+	if !pfManager.CanAcceptConnection(remoteAddr) {
+		newChan.Reject(ssh.ResourceShortage, "too many port forward connections")
+		logPortForward(remoteAddr, fmt.Sprintf("%s:%d", d.Addr, d.Port), false, "connection limit exceeded")
 		return
 	}
 
-	if !isPortAllowed(int(d.DestPort)) {
-		color.Red("Port forward rejected: port %d not allowed", d.DestPort)
-		newChan.Reject(ssh.Prohibited, fmt.Sprintf("port %d not allowed", d.DestPort))
-		return
-	}
-
-	// Connect to the destination
-	destAddr := fmt.Sprintf("%s:%d", d.DestAddr, d.DestPort)
-	destConn, err := net.Dial("tcp", destAddr)
+	// Connect to the target
+	target := fmt.Sprintf("%s:%d", d.Addr, d.Port)
+	targetConn, err := net.DialTimeout("tcp", target, 10*time.Second)
 	if err != nil {
-		color.Red("Failed to connect to %s: %v", destAddr, err)
 		newChan.Reject(ssh.ConnectionFailed, err.Error())
+		logPortForward(remoteAddr, target, false, fmt.Sprintf("connection failed: %v", err))
 		return
 	}
 
 	// Accept the channel
-	ch, reqs, err := newChan.Accept()
+	channel, requests, err := newChan.Accept()
 	if err != nil {
-		destConn.Close()
+		targetConn.Close()
+		logPortForward(remoteAddr, target, false, fmt.Sprintf("channel accept failed: %v", err))
 		return
 	}
 
-	color.Green("Port forward established: %s:%d -> %s:%d (user: %s)", 
-		d.SrcAddr, d.SrcPort, d.DestAddr, d.DestPort, ctx.User())
+	// Track the connection
+	pfManager.AddConnection(remoteAddr)
+	logPortForward(remoteAddr, target, true, "connection established")
 
-	// Handle channel requests (usually none for direct-tcpip)
-	go ssh.DiscardRequests(reqs)
+	// Handle any requests on this channel (typically none for direct-tcpip)
+	go ssh.DiscardRequests(requests)
 
-	// Start forwarding data between SSH channel and destination
+	// Start copying data bidirectionally
 	go func() {
-		defer ch.Close()
-		defer destConn.Close()
-		io.Copy(destConn, ch)
-	}()
+		defer func() {
+			targetConn.Close()
+			channel.Close()
+			pfManager.RemoveConnection(remoteAddr)
+			logPortForward(remoteAddr, target, true, "connection closed")
+		}()
 
-	go func() {
-		defer ch.Close()
-		defer destConn.Close()
-		io.Copy(ch, destConn)
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		// Copy from SSH channel to target
+		go func() {
+			defer wg.Done()
+			io.Copy(targetConn, channel)
+		}()
+
+		// Copy from target to SSH channel
+		go func() {
+			defer wg.Done()
+			io.Copy(channel, targetConn)
+		}()
+
+		wg.Wait()
 	}()
 }
 
-// Reverse port forwarding handler
-func handleReversePortForward(ctx ssh.Context, bindHost string, bindPort uint32) bool {
-	if !config.PortForward.Enable {
-		return false
+func logPortForward(clientIP, target string, success bool, message string) {
+	timestamp := time.Now().Format(time.RFC3339)
+	logEntry := fmt.Sprintf("%s - Port Forward - IP: %s, Target: %s, Success: %v, Message: %s", 
+		timestamp, clientIP, target, success, message)
+
+	if success {
+		color.Green(logEntry)
+	} else {
+		color.Red(logEntry)
 	}
 
-	if !isHostAllowed(bindHost) || !isPortAllowed(int(bindPort)) {
-		color.Red("Reverse port forward rejected: %s:%d not allowed", bindHost, bindPort)
-		return false
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		color.Red("Error getting home directory: %v", err)
+		return
 	}
 
-	color.Green("Reverse port forward request accepted: %s:%d (user: %s)", 
-		bindHost, bindPort, ctx.User())
-	return true
+	logFile := filepath.Join(homeDir, "ssh.log")
+	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		color.Red("Error opening log file: %v", err)
+		return
+	}
+	defer f.Close()
+
+	if _, err := f.WriteString(logEntry + "\n"); err != nil {
+		color.Red("Error writing to log file: %v", err)
+	}
 }
 
 func logLoginAttempt(ip, user string, success bool, method string) {
@@ -305,12 +360,25 @@ func checkPassword(storedPassword, inputPassword string) bool {
 	return storedPassword == inputPassword
 }
 
+// Function to print port forward statistics
+func printPortForwardStats() {
+	if pfManager != nil {
+		total, clients := pfManager.GetStats()
+		if total > 0 {
+			color.Cyan("Port Forward Stats: %d active connections from %d clients", total, clients)
+		}
+	}
+}
+
 func main() {
 	// Load configuration from YAML file
 	if err := loadConfig(); err != nil {
 		color.Red("Failed to load configuration: %v", err)
 		os.Exit(1)
 	}
+
+	// Initialize port forward manager
+	pfManager = NewPortForwardManager(config.PortForward.MaxConnections)
 
 	// Set default port if not configured
 	if config.SSH.Port == "" {
@@ -336,19 +404,18 @@ func main() {
 		},
 	}
 
-	// Add SFTP support
+	// Add SFTP support if enabled
 	if config.SFTP.Enable {
 		server.SubsystemHandlers = map[string]ssh.SubsystemHandler{
 			"sftp": sftpHandler,
 		}
 	}
 
-	// Add port forwarding support
+	// Add port forwarding support if enabled
 	if config.PortForward.Enable {
 		server.ChannelHandlers = map[string]ssh.ChannelHandler{
-			"direct-tcpip": directTCPIPHandler,
+			"direct-tcpip": tcpForwardHandler,
 		}
-		server.ReversePortForwardingCallback = handleReversePortForward
 	}
 
 	if config.SSH.Password == "" {
@@ -371,36 +438,30 @@ func main() {
 		color.Yellow("  - Using bcrypt hashed password")
 	}
 	color.Yellow("  - SFTP enabled: %v", config.SFTP.Enable)
-	color.Yellow("  - Port forwarding enabled: %v", config.PortForward.Enable)
-	
+	color.Yellow("  - Port Forward enabled: %v", config.PortForward.Enable)
 	if config.PortForward.Enable {
-		if len(config.PortForward.AllowedPorts) > 0 {
-			color.Yellow("  - Allowed ports: %v", config.PortForward.AllowedPorts)
-		} else {
-			color.Yellow("  - Allowed ports: all")
-		}
-		if len(config.PortForward.AllowedHosts) > 0 {
-			color.Yellow("  - Allowed hosts: %v", config.PortForward.AllowedHosts)
-		} else {
-			color.Yellow("  - Allowed hosts: all")
-		}
+		color.Yellow("  - Max port forward connections: %d", config.PortForward.MaxConnections)
 	}
-	
 	color.Blue("Starting SSH server on port %s...", config.SSH.Port)
-	color.Yellow("  - Type 'q' to exit.")
+	color.Yellow("  - Type 'q' to exit, 's' for stats.")
 
 	// Start the SSH server in a separate goroutine
 	go func() {
 		log.Fatal(server.ListenAndServe())
 	}()
 
-	// Scanner to detect 'q' input
+	// Scanner to detect input
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.TrimSpace(line) == "q" {
+		line := strings.TrimSpace(scanner.Text())
+		switch line {
+		case "q":
 			color.Yellow("Exit command detected. Closing the SSH server.")
 			os.Exit(0)
+		case "s":
+			printPortForwardStats()
+		default:
+			color.Yellow("Commands: 'q' to quit, 's' for port forward stats")
 		}
 	}
 }
